@@ -1,0 +1,136 @@
+variables:
+  POSTGRES_DB: test
+  POSTGRES_USER: test
+  POSTGRES_PASSWORD: test
+  POSTGRES_HOST_AUTH_METHOD: trust
+
+  # How to load git submodules
+  # https://docs.gitlab.com/ee/ci/runners/configure_runners.html#rewrite-submodule-urls-to-https
+  # At the same time, you need to add main priject to each submodule's allowed access at Settings > CI > Token Access
+  GIT_SUBMODULE_STRATEGY: recursive
+  GIT_SUBMODULE_FORCE_HTTPS: "true"
+
+services:
+  - postgres:13-alpine
+  - redis:6-alpine
+
+stages:
+  - test
+  - build
+  - package
+  - deploy
+  - notify
+
+test:
+  stage: test
+  image: rust:1.73.0-buster
+  before_script:
+    # This ensures ~/.cargo directory exists and cache saves/restores it correctly
+    - mkdir -p $CARGO_HOME/registry/
+  cache:
+    paths:
+      - target/
+      - $CARGO_HOME/registry/
+  script:
+    - apt-get update
+    - apt-get install openssl -y
+    - cp .env.example .env
+    - cp config/config.yaml.example config/config.yaml
+    - ./make_keys.sh
+    - export CARGO_BUILD_JOBS=$(nproc --all)
+    - cargo test
+
+build:
+  stage: build
+  image: rust:1.73.0-buster
+  before_script:
+    # This ensures ~/.cargo directory exists and cache saves/restores it correctly
+    - mkdir -p $CARGO_HOME/registry/
+  cache:
+    paths:
+      - target/
+      - $CARGO_HOME/registry/
+  script:
+    - export CARGO_BUILD_JOBS=$(nproc --all)
+    - ./build.sh -r
+  artifacts:
+    paths:
+      - target/x86_64-unknown-linux-gnu/release/gitfog-master
+    expire_in: 1 hour
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^dev-\d+\.\d+\.\d+$/
+    - if: $CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/
+
+docker-build:
+  stage: package
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  script:
+    - >-
+      /kaniko/executor
+      --context "${CI_PROJECT_DIR}"
+      --dockerfile "${CI_PROJECT_DIR}/Dockerfile"
+      --destination "${CI_REGISTRY_IMAGE}:${CI_COMMIT_TAG}"
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^dev-\d+\.\d+\.\d+$/
+    - if: $CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/
+
+deploy:
+  stage: deploy
+  image: alpine:latest
+  script:
+    - apk update && apk add --no-cache curl
+    - curl -LO https://storage.googleapis.com/kubernetes-release/release/`curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt`/bin/linux/amd64/kubectl
+    - chmod +x ./kubectl && mv ./kubectl /usr/local/bin/kubectl
+
+    # Decide the environment configuration based on the commit tag
+    - |
+      case "$CI_COMMIT_TAG" in
+        dev-*)
+          KUBECONFIG=${K8S_CONFIG_DEV}
+          NAMESPACE="${K8S_NAMESPACE_DEV}"
+          DOMAIN="gitfog.dev"
+          MESSAGE="Congrats🎖️🎖️🎖️! $CI_PROJECT_NAME of $DOMAIN has updated to $CI_COMMIT_TAG."
+          ;;
+        *)
+          KUBECONFIG=${K8S_CONFIG_PROD}
+          NAMESPACE="${K8S_NAMESPACE_PROD}"
+          DOMAIN="gitfog.com"
+          MESSAGE="🌟🌟🌟🌟🌟Production Environment🌟🌟🌟🌟🌟:\nCongrats🎖️🎖️🎖️! $CI_PROJECT_NAME of $DOMAIN has updated to $CI_COMMIT_TAG."
+          ;;
+      esac
+
+    # Use the determined KUBECONFIG and NAMESPACE
+    - kubectl scale --kubeconfig=${KUBECONFIG} --replicas=0 statefulset gitfog-master -n ${NAMESPACE}
+    - kubectl set image --kubeconfig=${KUBECONFIG} statefulset/gitfog-master gitfog-master=${CI_REGISTRY_IMAGE}:${CI_COMMIT_TAG} -n ${NAMESPACE}
+    - kubectl scale --kubeconfig=${KUBECONFIG} --replicas=1 statefulset gitfog-master -n ${NAMESPACE}
+
+    # Send notification with the determined MESSAGE_CONTENT
+    - |
+      curl --header "Content-Type: application/json"  \
+      --header "X-API-Token: $FEISHU_HELPER_TOKEN" \
+      --request POST \
+      --data "{\"receiver_name\": \"GitFog\",\"content\": \"$MESSAGE\"}" \
+      https://misc.springup.app/api/v1/feishu_helper/send_message
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^dev-\d+\.\d+\.\d+$/
+    - if: $CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/
+
+notify-failure:
+  stage: notify
+  image: alpine:latest
+  script:
+    - apk update && apk add --no-cache curl
+    - |
+      MESSAGE="Shame😳😳😳! A job for $CI_PROJECT_NAME failed at version $CI_COMMIT_TAG. Check the logs at $CI_PIPELINE_URL for more details."
+      curl --header "Content-Type: application/json" \
+           --header "X-API-Token: $FEISHU_HELPER_TOKEN" \
+           --request POST \
+           --data "{\"receiver_name\": \"GitFog\",\"content\": \"$MESSAGE\"}" \
+           https://misc.springup.app/api/v1/feishu_helper/send_message
+  when: on_failure
+  allow_failure: true
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^dev-\d+\.\d+\.\d+$/
+    - if: $CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/

@@ -1,0 +1,27 @@
+version: "3"
+
+services:
+  db:
+    image: postgres:13
+    restart: on-failure
+    environment:
+      POSTGRES_DB: test
+      POSTGRES_USER: test
+      POSTGRES_PASSWORD: test
+    ports:
+      - "5438:5432"
+    networks:
+      - gitfog-master
+  
+  redis:
+    image: redis:6
+    restart: on-failure
+    # command: redis-server --requirepass test
+    ports:
+      - 6378:6379
+    networks:
+      - gitfog-master
+
+networks:
+  gitfog-master:
+    driver: bridge
